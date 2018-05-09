@@ -1,0 +1,12 @@
+name: clustering_app
+title: Clustering_App
+username:
+account: ljfernando
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 339898
+bundleId: 1364106
+url: https://ljfernando.shinyapps.io/clustering_app/
+when: 1525843617.30604
+asMultiple: FALSE
+asStatic: FALSE

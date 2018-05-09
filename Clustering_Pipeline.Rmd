@@ -1,0 +1,382 @@
+---
+title: "One-Stop Shop Clustering"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: fill
+runtime: shiny
+
+---
+
+```{r setup, include=FALSE}
+library(flexdashboard)
+library(plotly)
+library(shiny)
+
+library(magrittr)
+library(d3heatmap)
+
+library(kmed) # k-medoids
+library(kernlab) # spectral clustering
+library(amap) # Kmeans
+
+
+
+# Calculates K-means, Hierarchical, K-medoids and Spectral clustering on a 
+# given numeric matrix X. Parameters such as K, distance, and linkage (hierarchical) 
+# may be given to test for different clustering approaches.
+#
+# args:
+#     X - Matrix or data frame containing only numeric values
+#     K - Number of clusters to create
+#     distance - Distance metric
+#     linkage - Linkage metric for hierarchical clustering
+makeClusters <- function(X, K, distance = c("euclidean", "pearson", "manhattan"), 
+                         linkage = c("average", "complete", "single"), scaled = TRUE,
+                         var_names = NULL){
+  # 
+  # if(!is.numeric(as.matrix(X)){
+  #   return("Please provide an X matrix with numeric values")
+  # }
+  
+  if(scaled){
+    X <- scale(X)
+  }
+  
+  # Kmeans
+  kmeans.out <- Kmeans(X, centers = K, iter.max = 50,
+                       nstart = 5, method = distance)
+  kmeans.clust <- kmeans.out$cluster
+  
+  # Hiearchical Clustering
+  dist.mat <- dist(X, method = ifelse(distance == "pearson",
+                                  "euclidean", distance))
+  hier.out <- hclust(dist.mat, method = linkage)
+  hier.clust <- cutree(hier.out, k = K)
+  
+  # K-medoids
+  kmed.dist <- distNumeric(x = X, y = X, method = switch(distance,
+                                                  euclidean = "se",
+                                                  manhattan = "mrw",
+                                                  pearson = "se"))
+  kmed.out <- fastkmed(kmed.dist, ncluster = K, iterate = 50)
+  kmed.clust <- kmed.out$cluster
+  
+  # spectral clustering
+  spec.out <- specc(x = X, centers = K, iterations = 50)
+  spec.clust <- spec.out@.Data
+  
+  # Creating dataframe with all cluster assignments
+  df <- cbind(X, kmeans.clust, hier.clust, 
+              kmed.clust, spec.clust)
+  
+
+  
+  return(list(heatmap = genPairMat(kmeans.clust, hier.clust,
+             kmed.clust, spec.clust, K, var_names),
+             df = df,
+             X = X,
+             var_names = var_names,
+             K = K,
+             kmeans = kmeans.out,
+             hier = hier.out,
+             kmed = kmed.out,
+             spec = spec.out))
+}
+
+# Computes a symmetric matrix that determines the number
+# of times a pair of observations are in the same cluster
+# based on the cluster assignments of kmeans, hierarchical, 
+# kmedoids, and spectral clustering. 
+#
+# args:
+#     Numeric vector of cluster assignments of the four algorithms
+#     K - Number of clusters
+#     var_names - Names of observations for visualization purposes
+#
+# returns:
+#     pairwise matrix of shared cluster assignments
+genPairMat <- function(kmeans.clust, hier.clust, kmed.clust, spec.clust, K,
+                       var_names){
+  
+  pair.mat <- matrix(data = rep(0, length(kmeans.clust) * length(kmeans.clust)), 
+                     ncol = length(kmeans.clust) , nrow = length(kmeans.clust))
+  K.list <- list()
+  clust.mat <- matrix(c(hier.clust, kmeans.clust, kmed.clust, spec.clust), 
+                         ncol = length(kmeans.clust), nrow = 4, byrow = TRUE)
+
+  for(i in 1:nrow(clust.mat)){
+    for(k in 1:K){
+      pairs <- unname(which(clust.mat[i,] == k)) %>% combn(m = 2)
+      if(which(unname(clust.mat[i,]) == k) %>% length() == 1){
+        next
+      }else{
+        for(p in 1:ncol(pairs)){
+          combo <- c(pairs[1,p], pairs[2,p])
+          curr_val <- pair.mat[ combo[1], combo[2]]
+          pair.mat[ combo[1], combo[2] ]<-  curr_val + 1
+          pair.mat[ combo[2], combo[1] ]<-  curr_val + 1
+
+        }
+      }
+    }
+  }
+  if(is.null(var_names)){
+    rownames(pair.mat) <- 1:ncol(pair.mat)
+    colnames(pair.mat) <- 1:ncol(pair.mat)
+  }else{
+    rownames(pair.mat) <- var_names
+    colnames(pair.mat) <- var_names
+  }
+  
+  return(pair.mat)
+}
+
+# Utilizes Consensus Clustering by clustering the 
+# matrix that tabulates the number of shared clusters
+# in the various algorithms for each observation. It then
+# performs spectral clustering to reorder the matrix
+# for a better looking heatmap
+#
+# args:
+#     mat - n x n matrix tabulating shared clusters
+#     K - Initial K for all algorithms
+#
+# returns:
+#     reordered matrix
+reorder_hm <- function(mat, K){
+  
+  spec.out <- specc(x = mat, centers = K, iterations = 50)
+  spec.clust <- spec.out@.Data %>% as.numeric()
+  
+  reordered.mat <- mat[order(spec.clust), order(spec.clust)]
+
+  return(reordered.mat)
+}
+
+# Reads a csv file from the given path with the 
+# following format:
+#   Column 1 - Names of the observations (unique for each row)
+#   Columns 2:end - Numeric attributes
+#
+# args:
+#     path - String indicating path to csv file
+#
+# returns:
+#   list()
+#     [[1]] - Scaled and na.omitted version of the dataset (without names)
+#     [[2]] - Observation names
+# 
+readFile <- function(path){
+  df <- read.csv(path, stringsAsFactors = FALSE)
+  df <- df %>% na.omit()
+  var_names <- df[,1]
+  out.mat <- df[,-1] %>% scale()
+  return(list(out.mat, var_names))
+}
+
+# Generates a heatmap given an n x n matrix that 
+# shows the number of clusters shaired between pairs
+# of observations. If we are interested in variables 
+# that have a specific number of shared clusters (degree),
+# then the matrix is modified accordingly.
+#
+# args:
+#     pair.mat - shared cluster matrix
+#     degree - number of shared clusters to focus (5 = show all)
+#     K - Initial K for all clustering algorithms
+#
+# returns
+#     d3heatmap() object
+genHeatmap <- function(pair.mat, degree, K){
+  if(degree == 5){
+    
+    return(d3heatmap(reorder_hm(pair.mat, K), dendrogram = 'none', colors = "Blues"))
+  }else{
+    tbl <- which(pair.mat == degree, arr.ind = TRUE)
+    tbl.names <- as.data.frame(tbl)
+    row <- rownames(tbl.names)
+    col <- colnames(output()$pair.mat)[tbl.names$col]
+    tbl.names$row <- row
+    tbl.names$col <- col
+    
+    all <- union(row, col)
+    
+    all.mat <- matrix(data = rep(0, length(all) * length(all)),
+                      nrow = length(all), byrow = TRUE)
+    
+    for(i in 1:nrow(tbl.names)){
+      s1 <- tbl.names[i,1]
+      s1_idx <- which(all == s1)
+      
+      s2 <- tbl.names[i,2]
+      s2_idx <- which(all == s2)
+      
+      idxs <- c(s1_idx, s2_idx)
+      all.mat[min(idxs),max(idxs)] <- as.numeric(degree)
+      all.mat[max(idxs),min(idxs)] <- as.numeric(degree)
+      
+    }
+    rownames(all.mat) <- all
+    colnames(all.mat) <- all
+    
+    reordered.mat <- reorder_hm(all.mat, K)
+    
+    return(d3heatmap(reordered.mat, dendrogram = 'none', colors = "Blues"))
+  }
+
+}
+
+# Generates a 4x4 scatterplot matrix of the
+# first four PCs of a numeric matrix and colors
+# points by cluster assignment
+generatePCPlots <- function(mat, cluster){
+  pr.out <- prcomp(mat)
+  out <- data.frame(pr.out$x[,1:4], cluster = as.factor(cluster))
+  pairs(pr.out$x[,1:4], col = unlist(cluster))
+}
+
+```
+
+
+Inputs {.sidebar data-width=250}
+-----------------------------------------------------------------------
+
+```{r}
+
+
+# Ability to choose data file. Only works when running locally
+# fileInput("dataset", label = h4("Select Dataset"),
+#           accept = c(
+#           "text/csv",
+#           "text/comma-separated-values,text/plain",
+#           ".csv"),
+#           placeholder = "No file selected")
+
+# Only choose from two preloaded dataset. Used for online version
+selectInput("dataset", label=h4("Select Dataset"),
+            choices = list('Top 50 Spotify' = 'top50_spotify.csv',
+                           'Credit Cards' = 'Credit_Cards.csv'),
+            selected = 'top50_spotify.csv')
+radioButtons('degree', label = h4("Heatmap Degree"),
+             choices = list('All' = 5, 'Deg. 4' = 4, 'Deg. 3' = 3,
+                            'Deg. 2' = 2, 'Deg. 1' = 1),
+             selected = 5, inline = TRUE)
+sliderInput("K", label = h4("K-Clusters"), 
+            min = 2, max = 25, 
+            value = 5)
+selectInput("distance", label = h4("Distance Metric"), 
+            choices = list("Euclidean", "Pearson", "Manhattan"),
+            selected = "Euclidean")
+selectInput("linkage", label = h4("Linkage Method"),
+            choices = list("Single", "Average", "Complete"),
+            selected = "Average")
+textInput('outFile', label= h4('Download Filepath'), placeholder = "ex. ~/Desktop/clusters.csv")
+actionButton('write', label=h5('Download clusters'))
+
+output <- reactive({
+  filename <- input$dataset
+  res <- makeClusters(readFile(filename)[[1]], K = input$K,
+               distance = tolower(input$distance),
+               linkage = tolower(input$linkage),
+               var_names = unlist(readFile(filename)[[2]]))
+  
+  list(pair.mat = res$heatmap,
+       df = res$df,
+       X = res$X,
+       var_names = res$var_names,
+       K = res$K,
+       kmeans = res$kmeans.out,
+       hier = res$hier.out,
+       kmed = res$kmed.out,
+       spec = res$spec.out)
+})
+
+observeEvent(input$write,{
+  write.csv(output()$df[,(ncol(output()$df) - 3): ncol(output()$df)],
+            input$outFile, row.names = FALSE)
+})
+
+```
+
+
+Row {.tabset .tabset-fade}
+-----------------------------------------------------------------------
+
+### Heatmap
+
+```{r}
+renderD3heatmap({
+  genHeatmap(output()$pair.mat,
+             input$degree, input$K)
+})
+```
+
+
+### K-Means
+
+```{r}
+renderPlot({
+
+  # Grabbing k-means column
+  kmeans_col <- output()$df[ ,ncol(output()$df) - 3]
+  
+  mat <- output()$df[ , -(seq ( from = ncol(output()$df) - 4,
+                         to = ncol(output()$df),
+                         by = 1))]
+  
+  
+  generatePCPlots(mat, kmeans_col)
+})
+```
+
+
+### Hierarchical 
+
+```{r}
+renderPlot({
+
+  # Grabbing hierarchical column
+  hier_col <- output()$df[ ,ncol(output()$df) - 2]
+  
+  mat <- output()$df[ , -(seq ( from = ncol(output()$df) - 4,
+                         to = ncol(output()$df),
+                         by = 1))]
+  
+  generatePCPlots(mat, hier_col)
+})
+```
+
+### K-Medoids
+
+```{r}
+renderPlot({
+
+  # Grabbing k-medoids column
+  kmed_col <- output()$df[ ,ncol(output()$df) - 1]
+  
+  mat <- output()$df[ , -(seq ( from = ncol(output()$df) - 4,
+                         to = ncol(output()$df),
+                         by = 1))]
+  
+  generatePCPlots(mat, kmed_col)
+})
+```
+
+### Spectral
+
+```{r}
+renderPlot({
+
+  # Grabbing hierarchical column
+  specc_col <- output()$df[ ,ncol(output()$df)]
+  
+  mat <- output()$df[ , -(seq ( from = ncol(output()$df) - 4,
+                         to = ncol(output()$df),
+                         by = 1))]
+  
+  generatePCPlots(mat, specc_col)
+})
+```
+
+
